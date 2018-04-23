@@ -63,11 +63,11 @@ func handleConnection(conn net.Conn) {
 
 func TestWriteHeap(t *testing.T) {
 	var reqs writeHeap
-	req1 := writeRequest{niceness: 1}
+	req1 := &writeRequest{niceness: 1}
 	heap.Push(&reqs, req1)
-	req3 := writeRequest{niceness: 3}
+	req3 := &writeRequest{niceness: 3}
 	heap.Push(&reqs, req3)
-	req2 := writeRequest{niceness: 2}
+	req2 := &writeRequest{niceness: 2}
 	heap.Push(&reqs, req2)
 	assert.Equal(t, heap.Pop(&reqs), req1)
 	assert.Equal(t, heap.Pop(&reqs), req2)
@@ -99,6 +99,7 @@ func TestEcho(t *testing.T) {
 	if sent != received {
 		t.Fatal("data mimatch")
 	}
+	fmt.Printf("here\n")
 	session.Close()
 }
 
@@ -596,10 +597,10 @@ func TestWriteDeadline(t *testing.T) {
 
 func TestSlowReceiverDoesNotBlock(t *testing.T) {
 	config := &Config{
-		KeepAliveInterval: 10 * time.Second,
-		KeepAliveTimeout:  30 * time.Second,
-		MaxFrameSize:      100,
-		MaxPerStreamReceiveBuffer:  1000,
+		KeepAliveInterval:         10 * time.Second,
+		KeepAliveTimeout:          30 * time.Second,
+		MaxFrameSize:              100,
+		MaxPerStreamReceiveBuffer: 1000,
 	}
 	ln, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
@@ -667,6 +668,76 @@ func TestSlowReceiverDoesNotBlock(t *testing.T) {
 	assert.Equal(t, n, 10*config.MaxPerStreamReceiveBuffer)
 	assert.Nil(t, err)
 	session.Close()
+}
+
+func TestPrioritizedStreams(t *testing.T) {
+	ln, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		session, err := Server(conn, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer session.Close()
+		for {
+			stream2, err := session.AcceptStream()
+			if err != nil {
+				t.Fatal(err)
+			}
+			go func() {
+				for {
+					_, err := stream2.Read(make([]byte, 32*1024))
+					if err == io.EOF {
+						return
+					} else if err != nil {
+						t.Fatal(err)
+					}
+				}
+			}()
+		}
+	}()
+
+	cli, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	session, err := Client(cli, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{}, 2)
+	go func() {
+		stream, err := session.OpenStreamOpt(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, err := stream.Write(make([]byte, 16*1024*1024))
+		assert.Nil(t, err)
+		assert.Equal(t, n, 16*1024*1024)
+		done <- struct{}{}
+	}()
+	go func() {
+		stream, err := session.OpenStreamOpt(2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, err := stream.Write(make([]byte, 16*1024*1024))
+		assert.Nil(t, err)
+		assert.Equal(t, n, 16*1024*1024)
+		done <- struct{}{}
+	}()
+	<-done
+	<-done
 }
 
 func BenchmarkAcceptClose(b *testing.B) {

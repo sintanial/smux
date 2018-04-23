@@ -33,7 +33,7 @@ type writeResult struct {
 	err error
 }
 
-type writeHeap []writeRequest
+type writeHeap []*writeRequest
 
 func (h writeHeap) Len() int { return len(h) }
 func (h writeHeap) Less(i, j int) bool {
@@ -47,7 +47,7 @@ func (h writeHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 func (h *writeHeap) Push(x interface{}) {
 	// Push and Pop use pointer receivers because they modify the slice's length,
 	// not just its contents.
-	*h = append(*h, x.(writeRequest))
+	*h = append(*h, x.(*writeRequest))
 }
 
 func (h *writeHeap) Pop() interface{} {
@@ -79,7 +79,7 @@ type Session struct {
 
 	deadline atomic.Value
 
-	writeTicket      chan struct{}
+	writeTickler     chan struct{}
 	writesLock       sync.Mutex
 	writes           writeHeap
 	writeSequenceNum uint64
@@ -92,7 +92,7 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	s.config = config
 	s.streams = make(map[uint32]*Stream)
 	s.chAccepts = make(chan *Stream, defaultAcceptBacklog)
-	s.writeTicket = make(chan struct{})
+	s.writeTickler = make(chan struct{}, 1)
 
 	if client {
 		s.nextStreamID = 1
@@ -324,16 +324,66 @@ func (s *Session) keepalive() {
 	}
 }
 
-func (s *Session) sendLoop() {
-	buf := make([]byte, (1<<16)+headerSize)
-	for {
+func (s *Session) waitForNextWrite(clampValidUntil time.Time) bool {
+	if time.Now().After(clampValidUntil) {
 		select {
 		case <-s.die:
+			return false
+		case <-s.writeTickler:
+		}
+	} else {
+		select {
+		case <-s.die:
+			return false
+		case <-s.writeTickler:
+		case <-time.NewTimer(clampValidUntil.Sub(time.Now())).C:
+		}
+	}
+	return true
+}
+
+func (s *Session) getNextRequestBelowClamp(clamp uint8) *writeRequest {
+	s.writesLock.Lock()
+	defer s.writesLock.Unlock()
+	if len(s.writes) == 0 {
+		return nil
+	}
+	if s.writes[0].niceness > clamp {
+		return nil
+	}
+	return heap.Pop(&s.writes).(*writeRequest)
+}
+
+func (s *Session) sendLoop() {
+	buf := make([]byte, (1<<16)+headerSize)
+
+	var clamp = uint8(255)
+	var clampValidUntil = time.Now().Add(-time.Hour)
+
+	for {
+		if shouldContinue := s.waitForNextWrite(clampValidUntil); !shouldContinue {
 			return
-		case <-s.writeTicket:
-			s.writesLock.Lock()
-			request := heap.Pop(&s.writes).(writeRequest)
-			s.writesLock.Unlock()
+		}
+
+		// Reset the clamp if it has expired
+		if time.Now().After(clampValidUntil) {
+			clamp = 255
+		}
+
+		var messageAtOrBelowClamp = false
+
+		// Keep looping until the heap is empty or we have no more messages below the clamp
+		for {
+			request := s.getNextRequestBelowClamp(clamp)
+			if request == nil {
+				break
+			}
+
+			// Control frames have a 0 niceness so don't let them influence the clamp setting
+			if request.niceness > 0 {
+				clamp = request.niceness
+				messageAtOrBelowClamp = true
+			}
 
 			buf[0] = request.frame.ver
 			buf[1] = request.frame.cmd
@@ -355,10 +405,14 @@ func (s *Session) sendLoop() {
 			request.result <- result
 			close(request.result)
 		}
+
+		if messageAtOrBelowClamp {
+			clampValidUntil = time.Now().Add(5 * time.Millisecond)
+		}
 	}
 }
 
-func (s *Session) queueFrame(niceness uint8, f Frame) (writeRequest, error) {
+func (s *Session) queueFrame(niceness uint8, f Frame) writeRequest {
 	req := writeRequest{
 		niceness: niceness,
 		sequence: atomic.AddUint64(&s.writeSequenceNum, 1),
@@ -366,23 +420,23 @@ func (s *Session) queueFrame(niceness uint8, f Frame) (writeRequest, error) {
 		result:   make(chan writeResult, 1),
 	}
 	s.writesLock.Lock()
-	heap.Push(&s.writes, req)
+	heap.Push(&s.writes, &req)
 	s.writesLock.Unlock()
 	select {
-	case <-s.die:
-		return req, errors.New(errBrokenPipe)
-	case s.writeTicket <- struct{}{}:
+	case s.writeTickler <- struct{}{}:
+	default:
 	}
-	return req, nil
+	return req
 }
 
 // writeFrame writes the frame to the underlying connection
 // and returns the number of bytes written if successful
-func (s *Session) writeFrame(niceness uint8, f Frame) (n int, err error) {
-	req, err := s.queueFrame(niceness, f)
-	if err != nil {
-		return 0, err
+func (s *Session) writeFrame(niceness uint8, f Frame) (int, error) {
+	req := s.queueFrame(niceness, f)
+	select {
+	case <-s.die:
+		return 0, errors.New(errBrokenPipe)
+	case result := <-req.result:
+		return result.n, result.err
 	}
-	result := <-req.result
-	return result.n, result.err
 }

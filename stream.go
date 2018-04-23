@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"container/heap"
 )
 
 // Stream implements net.Conn
@@ -117,28 +116,8 @@ func (s *Stream) Write(b []byte) (n int, err error) {
 				return sent, errTimeout
 			}
 		}
-
 		atomic.AddInt32(&s.writeTokenBucket, -int32(len(frames[k].data)))
-
-		req := writeRequest{
-			niceness: s.niceness,
-			sequence: atomic.AddUint64(&s.sess.writeSequenceNum, 1),
-			frame:    frames[k],
-			result:   make(chan writeResult, 1),
-		}
-
-		// TODO(jnewman): replace with session.writeFrame(..)?
-		s.sess.writesLock.Lock()
-		heap.Push(&s.sess.writes, req)
-		s.sess.writesLock.Unlock()
-		select {
-		case s.sess.writeTicket <- struct{}{}:
-		case <-s.die:
-			return sent, errors.New(errBrokenPipe)
-		case <-deadline:
-			return sent, errTimeout
-		}
-
+		req := s.sess.queueFrame(s.niceness, frames[k])
 		select {
 		case result := <-req.result:
 			sent += result.n
