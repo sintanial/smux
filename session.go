@@ -312,7 +312,9 @@ func (s *Session) keepalive() {
 	for {
 		select {
 		case <-tickerPing.C:
-			s.writeFrame(0, newFrame(cmdNOP, 0))
+			if atomic.LoadInt32(&s.dataReady) == 0 {
+				s.writeFrame(0, newFrame(cmdNOP, 0))
+			}
 		case <-tickerTimeout.C:
 			if !atomic.CompareAndSwapInt32(&s.dataReady, 1, 0) {
 				s.Close()
